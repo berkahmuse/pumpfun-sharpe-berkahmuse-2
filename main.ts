@@ -1,11 +1,12 @@
 // Steady Flow — a flow-filtered early-momentum paper bot for the pump.fun Sharpe sprint.
 //
 // Idea: a fresh bonding curve either catches a bid quickly or fades. This bot only enters
-// a coin once real buyers have already shown up — net buy flow dominates, the price sits
-// at least 10% above its creation price, and it is still rising over the last few prints —
-// then it stakes a small fixed size and manages the position with staged profit-taking,
-// a hard stop, a trailing exit and a stale-position exit. Small stakes, many coins and
-// tight exits aim at a steady hourly Sharpe, not one lucky moonshot.
+// a coin once real buyers have already shown up — net buy flow dominates 2:1, the
+// price sits at least 20% above its creation price, still rising over recent prints
+// with the latest print a buy — then it stakes a small fixed size and manages the
+// position with staged profit-taking, a hard stop, a trailing exit, a breakeven guard
+// and a stale-position exit. Small stakes, many coins and tight exits aim at a steady
+// hourly Sharpe, not one lucky moonshot.
 //
 // Guardrails honoured: at most 5 open positions, one buy per mint, every round trip at
 // least 0.01 SOL, no shorts, no leverage. Deterministic: no clock, no randomness, no
@@ -29,20 +30,22 @@ const MIN_STAKE_LAMPORTS = (SOL * 2n) / 100n; // never enter below 0.02 SOL (rou
 const BUY_SLIPPAGE_BPS = 3000;
 const SELL_SLIPPAGE_BPS = 2000;
 
-const MIN_TRADES = 6; // need a few prints before judging the flow
-const MAX_TRADES = 60; // decision window: judge a coin only while it is young
-const RISE_BPS = 1000; // price must sit >= 10% above its creation price
-const FLOW_BUY_NUM = 3n; // buy SOL volume must beat sell SOL volume 3:2
-const FLOW_BUY_DEN = 2n;
+const MIN_TRADES = 5; // need a few prints before judging the flow
+const MAX_TRADES = 40; // decision window: judge a coin only while it is young
+const RISE_BPS = 1000; // entry band: price >= 10% above creation ...
+const FLOW_BUY_NUM = 2n; // buy SOL volume must beat sell SOL volume 2:1
+const FLOW_BUY_DEN = 1n;
 const DEAD_MULT = 0.8; // price 20% under creation with prints behind it: a dead coin, drop it
 
-const TP1_MULT = 1.5; // sell half at +50%
-const TP2_MULT = 2.2; // sell the rest at +120%
-const STOP_MULT = 0.72; // hard stop at -28% from the filled cost
-const TRAIL_ARM_MULT = 1.35; // trailing exit arms once the mark peaked +35%
-const TRAIL_MULT = 0.75; // ...then exit when the mark falls 25% off that peak
-const STALE_SLOTS = 9000; // ~30 min of slots; exit a flat position
-const STALE_MULT = 1.05;
+const TP1_MULT = 1.25; // sell half at +25%
+const TP2_MULT = 2.0; // sell the rest at +100%
+const STOP_MULT = 0.92; // hard stop at -8% from the filled cost
+const TRAIL_ARM_MULT = 1.2; // trailing exit arms once the mark peaked +20%
+const TRAIL_MULT = 0.85; // ...then exit when the mark falls 15% off that peak
+const STALE_SLOTS = 3000; // ~11 min of slots; exit a flat position
+const STALE_MULT = 1.02;
+const BREAKEVEN_ARM_MULT = 1.1; // once a winner peaked +10% ...
+const BREAKEVEN_MULT = 1.02; // ...never let it come back below +2%
 
 const MAX_ORDERS_PER_BATCH = 12;
 
@@ -54,6 +57,7 @@ interface Coin {
   buyVol: bigint;
   sellVol: bigint;
   prices: number[];
+  lastBuy: boolean; // the most recent print was a buy: fresh bidding, not a fade
   bought: boolean;
   costPerToken: number; // lamports per token, from the buy fill (0 until filled)
   buySlot: number; // slot of the buy fill
@@ -98,6 +102,10 @@ await runBot({
 
     // 1. Fold this batch's fills into the per-coin books.
     for (const f of batch.fills) {
+      if (f.status === 'rejected' && f.side === 'buy') {
+        retire(f.mint); // one attempt per coin: a rejected buy means its cap or price ran away
+        continue;
+      }
       if (f.status !== 'filled') continue;
       const coin = live.get(f.mint);
       if (coin === undefined) continue;
@@ -133,6 +141,7 @@ await runBot({
             buyVol: 0n,
             sellVol: 0n,
             prices: [],
+            lastBuy: false,
             bought: false,
             costPerToken: 0,
             buySlot: 0,
@@ -155,6 +164,7 @@ await runBot({
           buyVol: 0n,
           sellVol: 0n,
           prices: [],
+          lastBuy: false,
           bought: false,
           costPerToken: 0,
           buySlot: 0,
@@ -164,6 +174,7 @@ await runBot({
         live.set(e.mint, coin);
       }
       coin.trades += 1;
+      coin.lastBuy = e.is_buy;
       const vol = BigInt(e.sol_amount);
       if (e.is_buy) coin.buyVol += vol;
       else coin.sellVol += vol;
@@ -216,7 +227,9 @@ await runBot({
       } else if (ratio >= TP2_MULT) {
         sellTokens = tokens; // second target: out
       } else if (coin.peak >= coin.costPerToken * TRAIL_ARM_MULT && price <= coin.peak * TRAIL_MULT) {
-        sellTokens = tokens; // gave back a quarter of the peak
+        sellTokens = tokens; // gave back a fifth of the peak
+      } else if (coin.peak >= coin.costPerToken * BREAKEVEN_ARM_MULT && ratio < BREAKEVEN_MULT) {
+        sellTokens = tokens; // a winner that came all the way back: keep the +2%
       } else if (
         coin.buySlot > 0 &&
         state.slot - coin.buySlot >= STALE_SLOTS &&
@@ -245,8 +258,10 @@ await runBot({
       const price = markPrice(state, mint);
       if (price <= 0) continue;
       if (price * 10_000 < coin.createPrice * (10_000 + RISE_BPS)) continue; // needs +10% from creation
+      if (price * 10_000 > coin.createPrice * 16_000) continue; // ...but not more than +60%: never chase the top
       if (coin.buyVol * FLOW_BUY_DEN <= coin.sellVol * FLOW_BUY_NUM) continue; // buyers must dominate 3:2
       if (coin.prices.length >= 2 && price < coin.prices[0]) continue; // still rising over recent prints
+      if (!coin.lastBuy) continue; // the latest print must be a buy, not a fade
       const cap = state.maxBuyLamports(mint);
       if (cap < MIN_STAKE_LAMPORTS) continue;
       const amount = cap < STAKE_LAMPORTS ? cap : STAKE_LAMPORTS;
