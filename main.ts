@@ -1,13 +1,12 @@
 // Steady Flow — a flow-filtered early-momentum paper bot for the pump.fun Sharpe sprint.
 //
 // Idea: a fresh bonding curve either catches a bid quickly or fades. This bot only enters
-// a coin once real buyers have already shown up — net buy flow dominates 2:1, the
-// price sits at least 20% above its creation price, still rising over recent prints
-// with the latest print a buy — then it stakes a small fixed size and manages the
-// position with staged profit-taking, a hard stop, a trailing exit, a breakeven guard
+// a coin once real buyers have already shown up — buy SOL volume beating sell volume
+// 2:1, the price inside a +10%..+60% band above its creation price, still rising over
+// recent prints with the latest print a buy — then it stakes a small fixed size and manages
+// the position with staged profit-taking, a hard stop, a trailing exit, a breakeven guard
 // and a stale-position exit. Small stakes, many coins and tight exits aim at a steady
 // hourly Sharpe, not one lucky moonshot.
-//
 // Guardrails honoured: at most 5 open positions, one buy per mint, every round trip at
 // least 0.01 SOL, no shorts, no leverage. Deterministic: no clock, no randomness, no
 // network, no environment reads — every decision comes from the harness state alone.
